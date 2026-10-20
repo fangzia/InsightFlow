@@ -1,0 +1,49 @@
+[project]
+name = "insightflow"
+version = "0.1.0"
+description = "Enterprise-grade data analysis agent, developed and benchmarked on Spider 2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.1.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "openai>=1.60",
+    "langgraph>=0.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.7",
+    "gdown>=2.6",
+]
+eval = [
+    "pandas>=2.2",
+    "tqdm>=4.66",
+    "google-cloud-bigquery>=1.40",  # only to satisfy eval_utils top-level import; local tasks never call it
+    # pinned to the 1.8 line: dbt-core >=1.9 enforces a packages.yml <-> dbt_packages
+    # consistency check that breaks the pre-vendored packages shipped with the
+    # Spider 2.0-DBT examples (the official baseline image also uses dbt 1.8).
+    # dbt-duckdb 1.8.x does not upper-bound dbt-core, so pin both explicitly.
+    "dbt-core>=1.8,<1.9",
+    "dbt-duckdb>=1.8,<1.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/insightflow"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["third_party", "runs", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
