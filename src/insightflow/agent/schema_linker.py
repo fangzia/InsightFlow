@@ -85,7 +85,7 @@ SCHEMA_DESIGN_TEMPLATE = """\
 # TASK
 {instruction}
 
-# TARGET MODELS
+{design_note}# TARGET MODELS
 {targets}
 
 {sizes}{drafts}# DATABASE SCHEMA
@@ -207,19 +207,26 @@ def design_contracts(
     existing_models: str = "",
     drafts: dict[str, dict] | None = None,
     required_sizes: dict[str, int] | None = None,
+    design_note: str = "",
 ) -> dict[str, dict]:
     """LLM 契约确定（v2 超集语义）：yml 草稿是最小覆盖，LLM 审阅只加
     不删；无草稿则按"最大化合理覆盖"从零设计。
 
     ``required_sizes`` 仅作为历史模式（agent-m2）的列数提示透传进提示
     词；v2 模式不传（消融已证明列数钉死是 v1 倒退的主凶）。
-    解析失败时安静降级为空（由调用方回退）。
+    ``design_note`` 为 M3 replan 注入的"前设计已废"上下文——要求换一种
+    设计思路而非原样重推。解析失败时安静降级为空（由调用方回退）。
     """
     if not targets:
         return {}
     sizes = required_sizes or {}
     user = SCHEMA_DESIGN_TEMPLATE.format(
         instruction=instruction,
+        design_note=(
+            "# DESIGN NOTE (previous design scrapped)\n" + design_note + "\n\n"
+            if design_note
+            else ""
+        ),
         targets="\n".join(f"- {name}: exactly {sizes[name]} columns" if name in sizes else f"- {name}" for name in targets),
         sizes=(
             _SIZES_TEMPLATE.format(
@@ -250,6 +257,7 @@ def build_contracts(
     target_models: list[str],
     existing_models: str = "",
     required_sizes: dict[str, int] | None = None,
+    design_note: str = "",
 ) -> dict[str, dict]:
     """契约组合入口（v2 超集语义）。
 
@@ -261,6 +269,7 @@ def build_contracts(
     v1 的"草稿列数与期望列数一致即直接采信"仲裁已移除——消融
     （agent-m2-nosize，14/64 vs 8/64）证明列数钉死是 v1 倒退的主凶；
     ``required_sizes`` 仅作为历史模式的列数提示透传。
+    ``design_note``：M3 replan 上下文（前设计反复失败，要求换思路）。
     """
     drafts = parse_yml_contracts(workspace / "models", target_models)
     try:
@@ -272,6 +281,7 @@ def build_contracts(
             existing_models,
             drafts=drafts,
             required_sizes=required_sizes,
+            design_note=design_note,
         )
     except Exception as e:  # noqa: BLE001
         print(f"WARNING: schema design failed ({type(e).__name__}: {e}); falling back to yml drafts")

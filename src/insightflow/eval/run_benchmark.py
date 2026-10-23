@@ -47,6 +47,145 @@ _MODES = {
     "agent-m2-v2": AgentOptions(
         schema_samples=3, max_attempts=3, use_linker=True, use_required_sizes=False, use_best_snapshot=True
     ),
+    # M3 第 1 步：v2 + 静态 lint + dbt 错误提炼 + 缺包安装 + 缺失祖先闭包
+    # + 坏 yml 隔离 + 坏模型剪除 + 池 0 救援
+    "agent-m3": AgentOptions(
+        schema_samples=3,
+        max_attempts=3,
+        use_linker=True,
+        use_required_sizes=False,
+        use_best_snapshot=True,
+        use_lint=True,
+        use_triage=True,
+        use_deps=True,
+        use_ancestors=True,
+        use_pool0_rescue=True,
+        use_yml_quarantine=True,
+        use_prune_blockers=True,
+        use_ref_repair=True,
+    ),
+    # M3 第 2 步：第 1 步 + 无进展检测触发 replan（设计层重来，限 1 次）
+    "agent-m3-replan": AgentOptions(
+        schema_samples=3,
+        max_attempts=3,
+        use_linker=True,
+        use_required_sizes=False,
+        use_best_snapshot=True,
+        use_lint=True,
+        use_triage=True,
+        use_deps=True,
+        use_ancestors=True,
+        use_pool0_rescue=True,
+        use_yml_quarantine=True,
+        use_prune_blockers=True,
+        use_ref_repair=True,
+        replan_limit=1,
+    ),
+    # M3 第 3 步：第 2 步 + 延迟多候选（预算耗尽后换独立轨迹，共 3 条）
+    "agent-m3-fanout": AgentOptions(
+        schema_samples=3,
+        max_attempts=3,
+        use_linker=True,
+        use_required_sizes=False,
+        use_best_snapshot=True,
+        use_lint=True,
+        use_triage=True,
+        use_deps=True,
+        use_ancestors=True,
+        use_pool0_rescue=True,
+        use_yml_quarantine=True,
+        use_prune_blockers=True,
+        use_ref_repair=True,
+        replan_limit=1,
+        n_candidates=3,
+    ),
+    # M3 第 4 步：第 3 步 + critic（verify 全绿后独立审查物化数据，限 1 次）
+    "agent-m3-critic": AgentOptions(
+        schema_samples=3,
+        max_attempts=3,
+        use_linker=True,
+        use_required_sizes=False,
+        use_best_snapshot=True,
+        use_lint=True,
+        use_triage=True,
+        use_deps=True,
+        use_ancestors=True,
+        use_pool0_rescue=True,
+        use_yml_quarantine=True,
+        use_prune_blockers=True,
+        use_ref_repair=True,
+        replan_limit=1,
+        n_candidates=3,
+        use_critic=True,
+    ),
+    # M3 第 4 步 v2：critic 换统计级证据（NULL/distinct/值域对账/粒度比），
+    # CHALLENGE 四段式可执行靶子；v1 采样证据保留供消融对照
+    "agent-m3-critic-v2": AgentOptions(
+        schema_samples=3,
+        max_attempts=3,
+        use_linker=True,
+        use_required_sizes=False,
+        use_best_snapshot=True,
+        use_lint=True,
+        use_triage=True,
+        use_deps=True,
+        use_ancestors=True,
+        use_pool0_rescue=True,
+        use_yml_quarantine=True,
+        use_prune_blockers=True,
+        use_ref_repair=True,
+        replan_limit=1,
+        n_candidates=3,
+        use_critic=True,
+        use_critic_v2=True,
+    ),
+    # M3 第 5 步：值层确定性信号——行数锚定（指令显式行数对照，行数是
+    # 评测器唯一硬约束）+ 单列重审（verify-green 双版本对照，弱列定向重写）
+    "agent-m3-anchor": AgentOptions(
+        schema_samples=3,
+        max_attempts=3,
+        use_linker=True,
+        use_required_sizes=False,
+        use_best_snapshot=True,
+        use_lint=True,
+        use_triage=True,
+        use_deps=True,
+        use_ancestors=True,
+        use_pool0_rescue=True,
+        use_yml_quarantine=True,
+        use_prune_blockers=True,
+        use_ref_repair=True,
+        replan_limit=1,
+        n_candidates=3,
+        use_critic=True,
+        use_critic_v2=True,
+        use_anchor=True,
+        use_column_review=True,
+    ),
+    # M3 第 5 步 b：+ 粒度词锚定（"monthly per X" → 行数 vs distinct(时间)×
+    # distinct(实体) 软性核对，阈值 [1/3, 3]）
+    "agent-m3-grain": AgentOptions(
+        schema_samples=3,
+        max_attempts=3,
+        use_linker=True,
+        use_required_sizes=False,
+        use_best_snapshot=True,
+        use_lint=True,
+        use_triage=True,
+        use_deps=True,
+        use_ancestors=True,
+        use_pool0_rescue=True,
+        use_yml_quarantine=True,
+        use_prune_blockers=True,
+        use_ref_repair=True,
+        replan_limit=1,
+        n_candidates=3,
+        use_critic=True,
+        use_critic_v2=True,
+        use_anchor=True,
+        use_column_review=True,
+        use_grain_anchor=True,
+    ),
 }
 
 
@@ -112,6 +251,29 @@ def render_model_specs(models_dir: Path, targets: list[str]) -> str:
     return "\n\n".join(sections) + "\n\n" if sections else ""
 
 
+def _absent_targets(workspace: Path, targets: list[str]) -> list[str]:
+    """ shipped .duckdb 中尚不存在的目标表（池 0 救援的准入条件）。
+
+    表已存在时不动它——mrr001/retail001 一族证明 shipped 表可能就是
+    gold 正确形态，重写反而有把 1.0 改成 0 的下行风险。
+    """
+    import duckdb
+
+    db_file = next(workspace.glob("*.duckdb"), None)
+    if db_file is None:
+        return list(targets)
+    con = duckdb.connect(str(db_file), read_only=True)
+    try:
+        rows = con.execute(
+            "select table_name from information_schema.tables "
+            "where table_schema not in ('information_schema', 'pg_catalog')"
+        ).fetchall()
+    finally:
+        con.close()
+    present = {r[0] for r in rows}
+    return [t for t in targets if t not in present]
+
+
 def run_one(agent: InsightFlowAgent, instance: dict, examples_dir: Path, run_dir: Path) -> dict:
     instance_id = instance["instance_id"]
     workspace = run_dir / "workspaces" / instance_id
@@ -126,13 +288,37 @@ def run_one(agent: InsightFlowAgent, instance: dict, examples_dir: Path, run_dir
 
     record = {"instance_id": instance_id, "success": False, "attempts": 0, "error": ""}
     if not missing:
-        # 全部模型已预实现：直接用 dbt 物化
+        # 全部模型已预实现：直接用 dbt 物化；失败且目标表缺失时交 agent 重建
         from insightflow.connectors.duckdb_executor import run_dbt
 
-        result = run_dbt(workspace, models=condition_tabs)
+        result = run_dbt(
+            workspace,
+            models=condition_tabs,
+            install_deps=agent.options.use_deps,
+            select_ancestors=agent.options.use_ancestors,
+            quarantine_yml=agent.options.use_yml_quarantine,
+        )
         record["success"] = result.success
         if not result.success:
             record["error"] = result.error_digest(500)
+            if agent.options.use_pool0_rescue:
+                absent = _absent_targets(workspace, condition_tabs)
+                if absent:
+                    print(f"[pool0-rescue] {instance_id}: rebuilding {absent}")
+                    try:
+                        final = agent.run(
+                            instruction=instance["instruction"],
+                            workspace=workspace,
+                            target_models=absent,
+                            model_specs=model_specs,
+                            select_models=condition_tabs,
+                            required_sizes=None,
+                        )
+                        record["success"] = final.get("success", False)
+                        record["attempts"] = final.get("attempts", 0)
+                        record["error"] = final.get("error_digest", "")[:500]
+                    except Exception as e:  # noqa: BLE001
+                        record["error"] = f"{type(e).__name__}: {e}"
     else:
         try:
             # 消融开关：关闭时不传期望列数（required_sizes=None），

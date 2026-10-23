@@ -55,7 +55,7 @@ USER_TEMPLATE = """\
 # TASK
 {instruction}
 
-# TARGET MODELS (implement exactly these)
+{redesign_note}# TARGET MODELS (implement exactly these)
 {targets}
 
 {model_specs}# COLUMN CONTRACTS (the final SELECT must include AT LEAST these columns; extra columns are free; order does not matter)
@@ -76,7 +76,7 @@ REPAIR_TEMPLATE = """\
 # TASK
 {instruction}
 
-# TARGET MODELS (implement exactly these)
+{redesign_note}# TARGET MODELS (implement exactly these)
 {targets}
 
 {model_specs}# COLUMN CONTRACTS (the final SELECT must include AT LEAST these columns; extra columns are free; order does not matter)
@@ -90,8 +90,8 @@ REPAIR_TEMPLATE = """\
 
 {failure_feedback}# YOUR ANSWER
 Fix the failing SQL. Re-emit the SQL for every target model listed above in
-the fenced-block format specified in the system message. Focus on fixing
-the reported problem; do not redesign parts that already work. When the
+the fenced-block format specified in the system message. Focus on fixing the
+reported problem; do not redesign parts that already work. When the
 fix concerns columns, only ADDITION is ever required: the contract is a
 minimum, extra columns are free, and column order does not matter.
 """
@@ -116,6 +116,172 @@ def build_failure_feedback(error_digest: str, column_issues: str) -> str:
     if not sections:
         sections.append("# PREVIOUS RUN FAILED\n(no diagnostics available)")
     return "\n\n".join(sections) + "\n\n"
+
+
+# --------------------------------------------------------------------------- M3 critic
+
+CRITIC_SYSTEM_PROMPT = """\
+You are a strict but pragmatic data reviewer. A dbt pipeline has materialized
+tables for an analytics task. Your job is to review whether the RESULT actually
+answers the task - a structural check already passed (columns are present),
+so focus on SEMANTICS: grain, measure definitions, and value plausibility.
+
+Check for:
+- Wrong grain: the task asks for e.g. monthly/customer-level rows but sampled
+  rows suggest a different granularity.
+- Implausible values: all-NULL key columns, negative quantities where the
+  domain forbids them, dates far outside the task's period, ratios above 1
+  when they are shares, duplicated identical rows.
+- Missing semantics the instruction explicitly asks for.
+
+Be conservative: this is a last-resort gate, and a wrong CHALLENGE costs a
+full redesign. Only challenge when the evidence clearly shows the table
+fails the task; when in doubt, APPROVE.
+
+Reply with EXACTLY one line, either:
+APPROVE
+or
+CHALLENGE: <one-sentence reason>
+"""
+
+CRITIC_TEMPLATE = """\
+# TASK
+{instruction}
+
+# MATERIALIZED TABLE SAMPLES (actual data from the run)
+{samples}
+
+# YOUR VERDICT
+APPROVE or CHALLENGE: <reason>
+"""
+
+# --------------------------------------------------------------------------- M3 critic v2（统计级证据）
+
+CRITIC_V2_SYSTEM_PROMPT = """\
+You are a strict data reviewer working from STATISTICAL EVIDENCE. A dbt
+pipeline has materialized tables for an analytics task; the structural check
+already passed (all contract columns are present). Your job: read the
+statistics computed from the ACTUAL data and decide whether the result
+plausibly answers the task.
+
+Check, in order:
+
+1. GRAIN: compare each table's row count with its source tables and with what
+   the task asks for (a monthly summary has ~12-24 rows per year and key; a
+   customer-level table has one row per customer; full order lines keep the
+   source row count).
+2. KEY MAPPING: columns named <prefix>_id should map to the id column of the
+   table named <prefix>. Their value range must overlap that existing table's
+   id range. A "NO OVERLAP" flag is strong evidence the join/mapping is wrong
+   (a common defect: recomputing surrogate keys instead of looking them up).
+3. VALUE SANITY: null-percentage, distinct counts, numeric ranges. All-NULL
+   key columns, shares/ratios above 1, negative quantities, implausible
+   magnitudes are defects.
+4. TASK SEMANTICS: measures the instruction explicitly names (revenue, MRR,
+   count of X, ...) - do the columns' magnitude and grain plausibly match?
+
+Be conservative but not blind: with NO OVERLAP key evidence, a grain that
+clearly contradicts the task, or an explicitly named measure that is visibly
+wrong, CHALLENGE. When the evidence is consistent with the task, APPROVE. A
+wrong CHALLENGE costs a full redesign; a blind APPROVE submits a wrong answer.
+
+Reply with EXACTLY one line, either:
+APPROVE
+or
+CHALLENGE: column '<col>': <observed statistic> conflicts with <task requirement>; likely cause: <cause>; fix hint: <suggestion>
+"""
+
+CRITIC_V2_TEMPLATE = """\
+# TASK
+{instruction}
+
+# MATERIALIZED TABLE STATISTICS (computed from the actual run)
+{stats}
+
+# YOUR VERDICT
+APPROVE or CHALLENGE: column '<col>': <stat> conflicts with <requirement>; likely cause: <cause>; fix hint: <hint>
+"""
+
+
+# --------------------------------------------------------------------------- M3 行数锚定
+
+ANCHOR_SYSTEM_PROMPT = """\
+You extract EXPLICIT output row-count constraints from an analytics task
+instruction. A constraint counts ONLY when the instruction states the number
+directly and unambiguously, e.g. "the top 10 actors", "the 5 most recent
+orders", "list the first 20 customers", "exactly 12 rows".
+
+Do NOT extract:
+- counts of input rows or time windows ("last 12 months", "orders in 2020")
+  unless they clearly mean the OUTPUT row count;
+- implicit quantities (per month, per customer) that depend on data;
+- numbers you computed or guessed yourself.
+
+Output ONE fenced JSON block and nothing else:
+
+```json
+{"<model_name>": <row_count>}
+```
+
+Only models from TARGET MODELS; omit models without an explicit row count
+(an empty object is a valid answer).
+"""
+
+ANCHOR_TEMPLATE = """\
+# TASK
+{instruction}
+
+# TARGET MODELS
+{targets}
+
+# YOUR ANSWER
+One JSON block mapping model names to their explicitly required row counts.
+"""
+
+
+# --------------------------------------------------------------------------- M3 粒度词锚定
+
+GRAIN_SYSTEM_PROMPT = """\
+You extract the OUTPUT GRAIN of each target model from an analytics task
+instruction. The grain is what ONE output row represents:
+
+- time_unit: the temporal aggregation the instruction explicitly asks for -
+  one of "day", "week", "month", "quarter", "year", or null when the
+  instruction does not state a time dimension.
+- entity: the subject one row is about, as a snake_case column-style hint
+  (e.g. "account_id", "customer", "region", "driver"), or null when the
+  output is one row per time unit (global totals).
+
+Examples:
+"Monthly recurring revenue for each account"
+  -> {"time_unit": "month", "entity": "account_id"}
+"Number of orders per customer"
+  -> {"time_unit": null, "entity": "customer_id"}
+"Daily active user counts"
+  -> {"time_unit": "day", "entity": null}
+"Top rated movies overall"
+  -> {"time_unit": null, "entity": null} (omit this model)
+
+Only extract what the instruction states; do not infer from table names or
+guess. Omit models whose grain the instruction does not determine.
+
+Output ONE fenced JSON block and nothing else:
+
+```json
+{"<model_name>": {"time_unit": "month", "entity": "account_id"}}
+```
+"""
+
+GRAIN_TEMPLATE = """\
+# TASK
+{instruction}
+
+# TARGET MODELS
+{targets}
+
+# YOUR ANSWER
+One JSON block with the output grain per model (omit undetermined models).
+"""
 
 _BLOCK_RE = re.compile(r"```sql\s+file=(\S+)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _FALLBACK_RE = re.compile(r"```(?:sql)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
